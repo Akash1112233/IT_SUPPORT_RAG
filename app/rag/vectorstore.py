@@ -171,6 +171,69 @@ def get_retriever():
     return get_vectorstore().as_retriever(search_kwargs={"k": settings.top_k})
 
 
+def search_documents_with_scores(
+    query: str,
+    k: int | None = None,
+):
+    """
+    Return the most similar documents and their similarity scores.
+
+    This is a diagnostic function for evaluating retrieval quality.
+    It does not write to or delete anything in Pinecone.
+    """
+    if not query or not query.strip():
+        raise ValueError("Search query cannot be empty.")
+
+    candidate_count = k if k is not None else settings.top_k
+
+    if candidate_count < 1 or candidate_count > 50:
+        raise ValueError("k must be between 1 and 50.")
+
+    store = get_vectorstore()
+
+    results = store.similarity_search_with_score(
+        query=query,
+        k=candidate_count,
+    )
+
+    return [
+        {
+            "content": document.page_content,
+            "metadata": document.metadata,
+            "score": float(score),
+        }
+        for document, score in results
+    ]
+
+
+
+def inspect_retrieval_results(query: str, k: int | None = None):
+    """
+    Return a readable diagnostic report for retrieved chunks.
+    Does not modify Pinecone data.
+    """
+    results = search_documents_with_scores(query, k=k)
+
+    report = []
+
+    for rank, result in enumerate(results, start=1):
+        metadata = result["metadata"]
+
+        report.append({
+            "rank": rank,
+            "score": result["score"],
+            "document_name": metadata.get(
+                "document_name",
+                metadata.get("source", "unknown"),
+            ),
+            "chunk_index": metadata.get("chunk_index"),
+            "document_hash": metadata.get("document_hash"),
+            "content_preview": result["content"][:300],
+        })
+
+    return report
+
+
 
 def add_documents(chunks):
     """

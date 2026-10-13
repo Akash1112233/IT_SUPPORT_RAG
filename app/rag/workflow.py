@@ -57,43 +57,120 @@ Return valid JSON like {{"route":"kb"}}.
 def route_after_router(state: AgentState) -> Literal["retrieve_kb", "direct_answer"]:
     return "retrieve_kb" if state["source_used"] == "kb" else "direct_answer"
 
+
 def retrieve_kb(state: AgentState):
-    docs = get_retriever().invoke(state["current_query"])
-    return {"kb_docs": docs, "trace": add_trace(state, f"Private KB retrieval → {len(docs)} chunks")}
+    """
+    Retrieve candidate chunks and preserve their vector-store scores
+    for diagnostics. Scores alone do not establish relevance.
+    """
+    if not state["current_query"].strip():
+        return {
+            "kb_docs": [],
+            "trace": add_trace(state, "Private KB retrieval skipped → empty query"),
+        }
+
+    from app.rag.vectorstore import get_vectorstore
+
+    results = get_vectorstore().similarity_search_with_score(
+        query=state["current_query"],
+        k=settings.top_k,
+    )
+
+    documents = []
+
+    for document, score in results:
+        # Keep retrieval diagnostics in metadata without changing
+        # the original chunk text.
+        document.metadata["_retrieval_score"] = float(score)
+        documents.append(document)
+
+    return {
+        "kb_docs": documents,
+        "trace": add_trace(
+            state,
+            f"Private KB retrieval → {len(documents)} candidate chunks",
+        ),
+    }
+
+
 
 def grade_kb(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
-    context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
+    """
+    Decide whether the retrieved private evidence directly answers
+    the user's question, rather than merely sharing similar terms.
+    """
+    documents = state.get("kb_docs", [])
+
+    if not documents:
+        return {
+            "kb_grade": "weak",
+            "trace": add_trace(
+                state,
+                "KB evidence grade → WEAK (no documents retrieved)",
+            ),
+        }
+
+    context_parts = []
+
+    for index, document in enumerate(documents, start=1):
+        source = document.metadata.get(
+            "document_name",
+            document.metadata.get("source", "unknown"),
+        )
+        context_parts.append(
+            f"Evidence {index}\n"
+            f"Source: {source}\n"
+            f"Content:\n{document.page_content}"
+        )
+
+    context = "\n\n".join(context_parts)
+
+    grader = llm().with_structured_output(
+        EvidenceGrade,
+        method="json_mode",
+    )
+
     grade = grader.invoke(f"""
-You grade evidence for an enterprise IT support assistant.
-Question: {state['question']}
-Private company KB evidence:\n{context}
-Return good only if the evidence is sufficient to answer confidently and specifically.
-Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
+You are a strict evidence-relevance evaluator for an enterprise
+IT support knowledge base.
+
+User question:
+{state['question']}
+
+Retrieved evidence:
+{context}
+
+Apply these rules:
+1. Grade GOOD only when the retrieved text directly and sufficiently
+   supports an answer to the specific question.
+2. Grade WEAK when the evidence is unrelated, only broadly related,
+   incomplete, or does not contain the requested troubleshooting steps.
+3. An IT-related document is not automatically relevant to every IT question.
+4. Do not fill missing information using general knowledge.
+5. If the question asks about Wi-Fi and the evidence only discusses email
+   or software installation, grade WEAK.
+6. Consider all retrieved chunks together, but do not assume facts
+   that the text does not state.
+
+Return valid JSON with exactly one field:
+{{"grade": "good"}}
+or
+{{"grade": "weak"}}
 """)
-    return {"kb_grade": grade.grade, "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}")}
 
-def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
-    return "generate_from_kb" if state["kb_grade"] == "good" else "search_web"
+    result = grade.grade.lower()
 
-def search_web(state: AgentState):
-    result = web_search_tool().invoke({"query": state["current_query"]})
-    lines, citations = [], []
-    if isinstance(result, dict):
-        if result.get("answer"):
-            lines.append("Search answer: " + result["answer"])
-        for item in result.get("results", []):
-            title, url, content = item.get("title", ""), item.get("url", ""), item.get("content", "")
-            lines.append(f"Title: {title}\nURL: {url}\nContent: {content}")
-            citations.append({"title": title or url, "url": url, "type": "web"})
-    else:
-        lines.append(str(result))
+    if result not in {"good", "weak"}:
+        result = "weak"
+
     return {
-        "web_results": "\n\n".join(lines),
-        "citations": citations,
-        "source_used": "web",
-        "trace": add_trace(state, "Web fallback → Tavily search"),
+        "kb_grade": result,
+        "trace": add_trace(
+            state,
+            f"KB evidence grade → {result.upper()}",
+        ),
     }
+
 
 def grade_web(state: AgentState):
     grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
