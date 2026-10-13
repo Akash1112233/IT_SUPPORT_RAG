@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = Field(
         default=45, ge=5, le=180
     )
+    max_upload_size_mb: int = Field(default=15, ge=1, le=100)
 
     # Admin security: no insecure default
     admin_api_key: str = ""

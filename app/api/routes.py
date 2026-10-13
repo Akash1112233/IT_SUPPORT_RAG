@@ -1,16 +1,17 @@
+import logging
+import zipfile
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+
 from fastapi import APIRouter, UploadFile, File, HTTPException, Header
 from pydantic import BaseModel, Field
+
 from app.core.config import get_settings
 from app.rag.workflow import ask
-from app.rag.vectorstore import add_documents 
+from app.rag.vectorstore import add_documents, delete_documents
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
 from app.services.audit import write_audit
 from app.services.document_identity import calculate_document_hash
-from app.rag.vectorstore import add_documents, delete_documents
-
-from app.services.document_identity import calculate_document_hash
-
 from app.services.document_manifest import (
     get_document,
     is_document_unchanged,
@@ -50,6 +51,58 @@ def chat(payload: ChatRequest):
 
 
 
+def validate_uploaded_content(filename: str, content: bytes) -> None:
+    """Reject obviously invalid files before document parsing."""
+    suffix = Path(filename).suffix.lower()
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
+
+    if suffix == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a valid PDF.",
+            )
+
+    elif suffix == ".docx":
+        # DOCX files are ZIP containers. This checks their
+        # container structure, not every aspect of the document.
+        from io import BytesIO
+
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                names = set(archive.namelist())
+                if (
+                    "[Content_Types].xml" not in names
+                    or "word/document.xml" not in names
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="The uploaded file is not a valid DOCX.",
+                    )
+                if archive.testzip() is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="The DOCX archive is corrupted.",
+                    )
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a valid DOCX.",
+            ) from exc
+
+    elif suffix in {".txt", ".md"}:
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Text files must use UTF-8 encoding.",
+            ) from exc
 
 
 @router.post("/ingest")
