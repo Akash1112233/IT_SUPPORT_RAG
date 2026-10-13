@@ -14,7 +14,7 @@ EMBEDDING_DIMENSIONS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
-    "all-minilm-l6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
 }
 
 def get_embedding_dimension(model_name: str | None = None) -> int:
