@@ -1,0 +1,9 @@
+IT SUPPORT TEST DOCUMENT
+
+Topic: VPN Troubleshooting
+
+Step 1: Check that your internet connection is working.
+Step 2: Open the company VPN application.
+Step 3: Sign in using your authorized company credentials.
+Step 4: Restart the VPN application if the connection fails.
+Step 5: Contact IT support if the problem continues.

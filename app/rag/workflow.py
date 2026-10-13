@@ -124,22 +124,74 @@ Question: {state['question']}
         "trace": add_trace(state, f"Query rewrite → {rewritten}"),
     }
 
+
 def generate_from_kb(state: AgentState):
-    context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
+    context = "\n\n".join(
+        f"[Source: {d.metadata.get('document_name', d.metadata.get('source', 'Private KB'))}]\n"
+        f"{d.page_content}"
+        for d in state["kb_docs"]
+    )
+
+    if not state["kb_docs"] or not context.strip():
+        return {
+            "answer": (
+                "I couldn't find sufficient evidence in the private "
+                "knowledge base to answer confidently. Please contact IT support."
+            ),
+            "source_used": "insufficient_evidence",
+            "citations": [],
+            "trace": add_trace(
+                state,
+                "Answer generation stopped → no private KB evidence",
+            ),
+        }
+
     answer = llm().invoke(f"""
-You are an enterprise IT support copilot. Answer ONLY from the private company KB below.
-Be concise, actionable, and safe. If steps are present, present them clearly.
-Do not invent policy details. Mention that the answer is based on the company's private knowledge base.
-Question: {state['question']}\n\nPrivate KB:\n{context}
+You are an enterprise IT support assistant.
+
+STRICT EVIDENCE RULES:
+- Answer using ONLY the supplied private knowledge-base evidence.
+- Do not add steps, policies, systems, credentials, MFA requirements,
+  gateway details, or troubleshooting instructions that are not stated
+  in the evidence.
+- If the evidence does not specify a detail, say it is not specified.
+- Do not use general knowledge to fill gaps.
+- Be concise and clearly list supported steps.
+
+Question:
+{state['question']}
+
+Private knowledge-base evidence:
+{context}
 """).content
+
     citations = []
     seen = set()
-    for d in state["kb_docs"]:
-        src = d.metadata.get("source", "Private KB")
-        if src not in seen:
-            seen.add(src)
-            citations.append({"title": src.split("/")[-1], "url": "", "type": "private_kb"})
-    return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
+
+    for document in state["kb_docs"]:
+        source = document.metadata.get(
+            "document_name",
+            document.metadata.get("source", "Private KB"),
+        )
+
+        if source not in seen:
+            seen.add(source)
+            citations.append({
+                "title": str(source).replace("\\", "/").split("/")[-1],
+                "url": "",
+                "type": "private_kb",
+            })
+
+    return {
+        "answer": answer,
+        "source_used": "private_kb",
+        "citations": citations,
+        "trace": add_trace(
+            state,
+            "Answer generation → PRIVATE KB",
+        ),
+    }
+
 
 def generate_from_web(state: AgentState):
     answer = llm().invoke(f"""

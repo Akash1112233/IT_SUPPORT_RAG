@@ -1,4 +1,5 @@
-from typing import List, Literal, Optional
+
+from typing import Any, List, Literal
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from langchain_core.documents import Document
@@ -6,13 +7,19 @@ from langchain_core.documents import Document
 
 class RouteDecision(BaseModel):
     route: Literal["kb", "direct"] = Field(
-        description="Use kb for questions needing Agentic RAG docs; direct for greetings/simple chat."
+        description=(
+            "Use kb for questions requiring company IT knowledge. "
+            "Use direct only for greetings or casual conversation."
+        )
     )
 
 
 class EvidenceGrade(BaseModel):
     grade: Literal["good", "weak"] = Field(
-        description="good means evidence can answer the question; weak means not enough evidence."
+        description=(
+            "good means the supplied evidence directly supports "
+            "a reliable answer. weak means evidence is insufficient."
+        )
     )
 
 
@@ -26,3 +33,5 @@ class AgentState(TypedDict):
     answer: str
     source_used: str
     retry_count: int
+    trace: List[str]
+    citations: List[dict[str, Any]]

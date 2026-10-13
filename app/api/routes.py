@@ -115,43 +115,59 @@ from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 
 
 
+
 @router.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),
     x_admin_key: str = Header(default=""),
 ):
-    # Require a configured admin key.
-    if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
-        raise HTTPException(status_code=401, detail="Invalid admin key")
-
     filename = Path(file.filename or "").name
-    suffix = Path(filename).suffix.lower()
-    if not filename or suffix not in SUPPORTED:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Supported: {', '.join(sorted(SUPPORTED))}",
-        )
+    temporary_path = None
 
     try:
-        # Stream the file in chunks to enforce the maximum upload limit in memory
+        # 1. Authenticate the upload request.
+        if (
+            not settings.admin_api_key
+            or x_admin_key != settings.admin_api_key
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid admin key",
+            )
+
+        # 2. Validate the filename and extension.
+        suffix = Path(filename).suffix.lower()
+
+        if not filename or suffix not in SUPPORTED:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Supported: {', '.join(sorted(SUPPORTED))}",
+            )
+
+        # 3. Read the file with a strict size limit.
         max_bytes = settings.max_upload_size_mb * 1024 * 1024
         file_bytes = bytearray()
-        
+
         while True:
             remaining = max_bytes + 1 - len(file_bytes)
+
             if remaining <= 0:
                 break
-            
+
             block = await file.read(min(64 * 1024, remaining))
+
             if not block:
                 break
-            
+
             file_bytes.extend(block)
-            
+
             if len(file_bytes) > max_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"File exceeds the maximum upload size of {settings.max_upload_size_mb} MB.",
+                    detail=(
+                        "File exceeds the maximum upload size of "
+                        f"{settings.max_upload_size_mb} MB."
+                    ),
                 )
 
         if not file_bytes:
@@ -160,21 +176,15 @@ async def ingest(
                 detail="Uploaded file is empty.",
             )
 
-        file_bytes = bytes(file_bytes)
-        
-        # Optional custom content validation step based on your snippet
-        validate_uploaded_content(filename, file_bytes)
+        content = bytes(file_bytes)
 
-        # Step 1: Identify the exact uploaded file version.
-        document_hash = calculate_document_hash(file_bytes)
+        # 4. Validate content before saving or parsing it.
+        validate_uploaded_content(filename, content)
 
-        # Step 2: Save the file for the existing document loaders.
-        upload_dir = Path(settings.upload_dir).resolve()
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        destination = upload_dir / filename
-        destination.write_bytes(file_bytes)
+        # 5. Identify this exact document version.
+        document_hash = calculate_document_hash(content)
 
-        # Step 3: Skip files whose current version is already indexed.
+        # 6. Skip indexing if this version is already indexed.
         if is_document_unchanged(filename, document_hash):
             return {
                 "message": "Document is unchanged; indexing skipped.",
@@ -184,19 +194,49 @@ async def ingest(
                 "skipped": True,
             }
 
-        # Keep the previous manifest entry so we know which old
-        # vectors belong to this document.
+        # 7. Read the previous manifest before marking this version
+        # pending. Preserve the IDs needed for safe replacement.
         previous_record = get_document(filename)
+
         old_ids = (
-            previous_record["chunk_ids"] if previous_record is not None else []
+            previous_record["chunk_ids"]
+            if previous_record is not None
+            else []
         )
 
-        # Step 4: Mark this version pending. The manifest retains
-        # the previous chunk IDs until indexing completes.
+        # 8. Create a separate file for this content version.
+        upload_dir = Path(settings.upload_dir).resolve()
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        original_path = Path(filename)
+        versioned_filename = (
+            f"{original_path.stem}_{document_hash[:12]}"
+            f"{original_path.suffix.lower()}"
+        )
+        destination = upload_dir / versioned_filename
+
+        # Do not rewrite a versioned file that already exists.
+        if not destination.exists():
+            with NamedTemporaryFile(
+                mode="wb",
+                dir=upload_dir,
+                suffix=suffix,
+                delete=False,
+            ) as temp_file:
+                temporary_path = Path(temp_file.name)
+                temp_file.write(content)
+
+            # Atomically publish the completed temporary file.
+            temporary_path.replace(destination)
+            temporary_path = None
+
+        # 9. Record that this version is being processed.
+        # Existing chunk IDs remain in the manifest on conflict.
         mark_document_pending(filename, document_hash)
 
-        # Step 5: Load and split the document.
+        # 10. Load and split the versioned file.
         documents = load_file(destination)
+
         for document in documents:
             document.metadata.update({
                 "document_name": filename,
@@ -204,29 +244,32 @@ async def ingest(
             })
 
         chunks = chunk_documents(documents)
+
         if not chunks:
             raise HTTPException(
                 status_code=400,
                 detail="No readable text was found in the document.",
             )
 
-        # Step 6: Upsert the new version using deterministic IDs.
+        # 11. Index the new version with deterministic vector IDs.
         new_ids = add_documents(chunks)
-        if not new_ids:
+
+        if not new_ids or len(new_ids) != len(chunks):
             raise RuntimeError(
-                "Vector store did not return IDs for the indexed chunks."
+                "The vector store did not return an ID for every chunk."
             )
 
-        # Step 7: Delete only obsolete IDs from the previous
-        # manifest version. New vectors are already indexed.
+        # 12. Remove only obsolete IDs recorded for this document.
         new_id_set = set(new_ids)
         obsolete_ids = [
-            old_id for old_id in old_ids if old_id not in new_id_set
+            old_id for old_id in old_ids
+            if old_id not in new_id_set
         ]
+
         delete_documents(obsolete_ids)
 
-        # Step 8: Commit the new version to the manifest only
-        # after indexing and obsolete-vector deletion succeed.
+        # 13. Mark the new version indexed only after the preceding
+        # vector operations have completed successfully.
         mark_document_indexed(
             document_name=filename,
             document_hash=document_hash,
@@ -244,16 +287,28 @@ async def ingest(
 
     except HTTPException:
         raise
+
     except Exception as exc:
-        # Log the exception server-side rather than exposing
-        # internal implementation details to API clients.
         logging.getLogger(__name__).exception(
-            "Document ingestion failed for %s", filename
+            "Document ingestion failed for %s",
+            filename or "<unnamed file>",
         )
+
         raise HTTPException(
             status_code=500,
             detail="Document ingestion failed. Check application logs.",
         ) from exc
+
     finally:
+        # Remove an incomplete temporary file if writing failed.
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logging.getLogger(__name__).warning(
+                    "Could not remove temporary upload file."
+                )
+
         await file.close()
+
 
