@@ -221,3 +221,21 @@ def add_documents(chunks):
         ids.append(chunk_id)
 
     return store.add_documents(documents=chunks, ids=ids)
+
+
+
+def delete_documents(ids: list[str]):
+    """
+    Delete specific vectors from the configured Pinecone namespace.
+
+    Only explicitly supplied IDs are deleted.
+    """
+    if not ids:
+        return None
+
+    index = ensure_index()
+
+    return index.delete(
+        ids=ids,
+        namespace=settings.pinecone_namespace,
+    )

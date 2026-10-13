@@ -7,6 +7,16 @@ from app.rag.vectorstore import add_documents
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
 from app.services.audit import write_audit
 from app.services.document_identity import calculate_document_hash
+from app.rag.vectorstore import add_documents, delete_documents
+
+from app.services.document_identity import calculate_document_hash
+
+from app.services.document_manifest import (
+    get_document,
+    is_document_unchanged,
+    mark_document_indexed,
+    mark_document_pending,
+)
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
@@ -41,11 +51,13 @@ def chat(payload: ChatRequest):
 
 
 
+
 @router.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),
     x_admin_key: str = Header(default=""),
 ):
+    # Require a configured admin key.
     if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
         raise HTTPException(status_code=401, detail="Invalid admin key")
 
@@ -58,56 +70,116 @@ async def ingest(
             detail=f"Supported: {', '.join(sorted(SUPPORTED))}",
         )
 
-    file_bytes = await file.read()
-
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    upload_dir = Path(settings.upload_dir).resolve()
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    dest = upload_dir / filename
-
     try:
-        # Hash the original bytes, not the extracted text.
+        file_bytes = await file.read()
+
+        if not file_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
+
+        # Step 1: Identify the exact uploaded file version.
         document_hash = calculate_document_hash(file_bytes)
 
-        # Store the upload after validating its extension.
-        dest.write_bytes(file_bytes)
+        # Step 2: Save the file for the existing document loaders.
+        upload_dir = Path(settings.upload_dir).resolve()
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-        docs = load_file(dest)
+        destination = upload_dir / filename
+        destination.write_bytes(file_bytes)
 
-        # Attach document identity before splitting into chunks.
-        for doc in docs:
-            doc.metadata.update({
+        # Step 3: Skip files whose current version is already indexed.
+        if is_document_unchanged(filename, document_hash):
+            return {
+                "message": "Document is unchanged; indexing skipped.",
+                "file": filename,
+                "document_hash": document_hash,
+                "chunks": 0,
+                "skipped": True,
+            }
+
+        # Keep the previous manifest entry so we know which old
+        # vectors belong to this document.
+        previous_record = get_document(filename)
+        old_ids = (
+            previous_record["chunk_ids"]
+            if previous_record is not None
+            else []
+        )
+
+        # Step 4: Mark this version pending. The manifest retains
+        # the previous chunk IDs until indexing completes.
+        mark_document_pending(filename, document_hash)
+
+        # Step 5: Load and split the document.
+        documents = load_file(destination)
+
+        for document in documents:
+            document.metadata.update({
                 "document_name": filename,
                 "document_hash": document_hash,
             })
 
-        chunks = chunk_documents(docs)
+        chunks = chunk_documents(documents)
 
         if not chunks:
             raise HTTPException(
                 status_code=400,
-                detail="No readable text was found in the uploaded file.",
+                detail="No readable text was found in the document.",
             )
 
-        ids = add_documents(chunks)
+        # Step 6: Upsert the new version using deterministic IDs.
+        new_ids = add_documents(chunks)
+
+        if not new_ids:
+            raise RuntimeError(
+                "Vector store did not return IDs for the indexed chunks."
+            )
+
+        # Step 7: Delete only obsolete IDs from the previous
+        # manifest version. New vectors are already indexed.
+        new_id_set = set(new_ids)
+        obsolete_ids = [
+            old_id for old_id in old_ids
+            if old_id not in new_id_set
+        ]
+
+        delete_documents(obsolete_ids)
+
+        # Step 8: Commit the new version to the manifest only
+        # after indexing and obsolete-vector deletion succeed.
+        mark_document_indexed(
+            document_name=filename,
+            document_hash=document_hash,
+            chunk_ids=new_ids,
+        )
 
         return {
-            "message": "Document indexed",
+            "message": "Document indexed successfully.",
             "file": filename,
             "document_hash": document_hash,
-            "chunks": len(chunks),
-            "ids_created": len(ids),
+            "chunks": len(new_ids),
+            "skipped": False,
+            "obsolete_chunks_removed": len(obsolete_ids),
         }
 
     except HTTPException:
         raise
+
     except Exception as exc:
+        # Log the exception server-side rather than exposing
+        # internal implementation details to API clients.
+        import logging
+        logging.getLogger(__name__).exception(
+            "Document ingestion failed for %s",
+            filename,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail="Document ingestion failed. Check the application logs.",
+            detail="Document ingestion failed. Check application logs.",
         ) from exc
+
     finally:
         await file.close()
