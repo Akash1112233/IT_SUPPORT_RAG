@@ -6,6 +6,7 @@ from app.rag.workflow import ask
 from app.rag.vectorstore import add_documents 
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
 from app.services.audit import write_audit
+from app.services.document_identity import calculate_document_hash
 
 router = APIRouter(prefix="/api")
 settings = get_settings()
@@ -39,18 +40,74 @@ def chat(payload: ChatRequest):
 
 
 
+
 @router.post("/ingest")
-async def ingest(file: UploadFile = File(...), x_admin_key: str = Header(default="")):
-    if x_admin_key != settings.admin_api_key:
+async def ingest(
+    file: UploadFile = File(...),
+    x_admin_key: str = Header(default=""),
+):
+    if not settings.admin_api_key or x_admin_key != settings.admin_api_key:
         raise HTTPException(status_code=401, detail="Invalid admin key")
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in SUPPORTED:
-        raise HTTPException(status_code=400, detail=f"Supported: {', '.join(sorted(SUPPORTED))}")
-    upload_dir = Path(settings.upload_dir)
+
+    filename = Path(file.filename or "").name
+    suffix = Path(filename).suffix.lower()
+
+    if not filename or suffix not in SUPPORTED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Supported: {', '.join(sorted(SUPPORTED))}",
+        )
+
+    file_bytes = await file.read()
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    upload_dir = Path(settings.upload_dir).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
-    dest = upload_dir / Path(file.filename).name
-    dest.write_bytes(await file.read())
-    docs = load_file(dest)
-    chunks = chunk_documents(docs)
-    ids = add_documents(chunks)
-    return {"message": "Document indexed", "file": dest.name, "chunks": len(chunks), "ids_created": len(ids)}
+
+    dest = upload_dir / filename
+
+    try:
+        # Hash the original bytes, not the extracted text.
+        document_hash = calculate_document_hash(file_bytes)
+
+        # Store the upload after validating its extension.
+        dest.write_bytes(file_bytes)
+
+        docs = load_file(dest)
+
+        # Attach document identity before splitting into chunks.
+        for doc in docs:
+            doc.metadata.update({
+                "document_name": filename,
+                "document_hash": document_hash,
+            })
+
+        chunks = chunk_documents(docs)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No readable text was found in the uploaded file.",
+            )
+
+        ids = add_documents(chunks)
+
+        return {
+            "message": "Document indexed",
+            "file": filename,
+            "document_hash": document_hash,
+            "chunks": len(chunks),
+            "ids_created": len(ids),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Document ingestion failed. Check the application logs.",
+        ) from exc
+    finally:
+        await file.close()

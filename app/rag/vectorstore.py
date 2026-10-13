@@ -4,6 +4,12 @@ from pinecone import Pinecone , ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
 from app.core.config import get_settings
 from langchain_huggingface import HuggingFaceEmbeddings
+from pathlib import Path
+
+from app.services.document_identity import (
+    calculate_chunk_id,
+    build_chunk_metadata,
+)
 
 settings = get_settings()
 
@@ -50,36 +56,103 @@ def get_embeddings():
     return _embeddings
 
 
+
 def ensure_index():
+    """Connect to the configured Pinecone index safely.
+
+    Never automatically delete an existing index.
+    Index migrations must be explicit administrative actions.
+    """
     if not settings.pinecone_api_key:
-        raise RuntimeError("PINECONE_API_KEY is missing")
+        raise RuntimeError(
+            "PINECONE_API_KEY is missing."
+        )
 
     desired_dimension = get_embedding_dimension()
-    pc = Pinecone(api_key=settings.pinecone_api_key)
-    names = [x["name"] for x in pc.list_indexes()]
 
-    if settings.pinecone_index_name in names:
-        index_info = pc.describe_index(settings.pinecone_index_name)
-        current_dimension = getattr(index_info, "dimension", None)
-        if current_dimension is None and isinstance(index_info, dict):
-            current_dimension = index_info.get("dimension")
+    pc = Pinecone(
+        api_key=settings.pinecone_api_key
+    )
 
-        if current_dimension is not None and current_dimension != desired_dimension:
-            pc.delete_index(name=settings.pinecone_index_name)
-            while settings.pinecone_index_name in [x["name"] for x in pc.list_indexes()]:
-                time.sleep(1)
+    index_names = {
+        item["name"]
+        for item in pc.list_indexes()
+    }
 
-    if settings.pinecone_index_name not in [x["name"] for x in pc.list_indexes()]:
-        pc.create_index(
-            name=settings.pinecone_index_name,
-            dimension=desired_dimension,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    if settings.pinecone_index_name in index_names:
+        index_info = pc.describe_index(
+            settings.pinecone_index_name
         )
-        while not pc.describe_index(settings.pinecone_index_name).status["ready"]:
-            time.sleep(1)
 
-    return pc.Index(settings.pinecone_index_name)
+        current_dimension = getattr(
+            index_info, "dimension", None
+        )
+
+        if current_dimension is None and isinstance(
+            index_info, dict
+        ):
+            current_dimension = index_info.get(
+                "dimension"
+            )
+
+        if current_dimension != desired_dimension:
+            raise RuntimeError(
+                "Pinecone embedding dimension mismatch. "
+                f"Index '{settings.pinecone_index_name}' "
+                f"has dimension {current_dimension}, but "
+                f"the configured embedding model expects "
+                f"{desired_dimension}. No index was deleted. "
+                "Verify the model and index before migrating."
+            )
+
+        return pc.Index(
+            settings.pinecone_index_name
+        )
+
+    # Create an index only if it does not already exist.
+    pc.create_index(
+        name=settings.pinecone_index_name,
+        dimension=desired_dimension,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1",
+        ),
+    )
+
+    # Wait for the newly created index to become ready.
+    import time
+
+    deadline = time.monotonic() + 120
+
+    while time.monotonic() < deadline:
+        index_info = pc.describe_index(
+            settings.pinecone_index_name
+        )
+
+        status = getattr(
+            index_info, "status", None
+        )
+
+        if isinstance(status, dict):
+            ready = status.get("ready", False)
+        else:
+            ready = getattr(
+                status, "ready", False
+            )
+
+        if ready:
+            return pc.Index(
+                settings.pinecone_index_name
+            )
+
+        time.sleep(2)
+
+    raise TimeoutError(
+        "Pinecone index was created but did not "
+        "become ready within 120 seconds."
+    )
+
 
 
 def get_vectorstore():
@@ -98,6 +171,53 @@ def get_retriever():
     return get_vectorstore().as_retriever(search_kwargs={"k": settings.top_k})
 
 
+
 def add_documents(chunks):
+    """
+    Store document chunks using deterministic IDs.
+
+    Re-ingesting an unchanged document with the same chunking
+    configuration will update the corresponding vector IDs
+    instead of creating new IDs for the same chunks.
+    """
+    if not chunks:
+        return []
+
     store = get_vectorstore()
-    return store.add_documents(chunks)
+    ids = []
+
+    for index, chunk in enumerate(chunks):
+        document_hash = chunk.metadata.get("document_hash")
+
+        if not document_hash:
+            raise ValueError(
+                "Missing document_hash in chunk metadata. "
+                "Calculate the document hash before indexing."
+            )
+
+        document_name = (
+            chunk.metadata.get("document_name")
+            or Path(chunk.metadata.get("source", "unknown")).name
+            or "unknown"
+        )
+
+        chunk_id = calculate_chunk_id(
+            document_hash=document_hash,
+            chunk_index=index,
+            chunk_text=chunk.page_content,
+        )
+
+        metadata = build_chunk_metadata(
+            document_name=document_name,
+            document_hash=document_hash,
+            chunk_index=index,
+            chunk_text=chunk.page_content,
+            extra_metadata=chunk.metadata,
+        )
+
+        # Preserve LangChain's document structure while adding
+        # identity metadata needed for traceability.
+        chunk.metadata = metadata   
+        ids.append(chunk_id)
+
+    return store.add_documents(documents=chunks, ids=ids)
