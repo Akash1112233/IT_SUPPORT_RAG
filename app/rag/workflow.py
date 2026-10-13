@@ -172,6 +172,63 @@ or
     }
 
 
+def after_kb(
+    state: AgentState,
+) -> Literal["generate_from_kb", "search_web"]:
+    """
+    Choose the next graph node based on KB evidence quality.
+    """
+    if state["kb_grade"] == "good":
+        return "generate_from_kb"
+
+    return "search_web"
+
+
+def search_web(state: AgentState):
+    """
+    Search the web when private knowledge-base evidence is insufficient.
+    """
+    result = web_search_tool().invoke({
+        "query": state["current_query"]
+    })
+
+    lines = []
+    citations = []
+
+    if isinstance(result, dict):
+        if result.get("answer"):
+            lines.append("Search answer: " + str(result["answer"]))
+
+        for item in result.get("results", []):
+            title = item.get("title", "")
+            url = item.get("url", "")
+            content = item.get("content", "")
+
+            lines.append(
+                f"Title: {title}\n"
+                f"URL: {url}\n"
+                f"Content: {content}"
+            )
+
+            if url:
+                citations.append({
+                    "title": title or url,
+                    "url": url,
+                    "type": "web",
+                })
+    else:
+        lines.append(str(result))
+
+    return {
+        "web_results": "\n\n".join(lines),
+        "citations": citations,
+        "source_used": "web",
+        "trace": add_trace(
+            state,
+            "Web fallback → Tavily search",
+        ),
+    }
+
 def grade_web(state: AgentState):
     grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
     grade = grader.invoke(f"""
