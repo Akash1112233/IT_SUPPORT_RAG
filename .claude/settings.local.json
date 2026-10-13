@@ -1,0 +1,13 @@
+{
+  "env": {
+    "CLAUDE_CONFIG_DIR": "C:\\Users\\amidia\\.claude-omniroute",
+    "ANTHROPIC_BASE_URL": "http://localhost:20128",
+    "ANTHROPIC_AUTH_TOKEN": "sk-6b8b0712a3b5849d-829062-21d51d5d",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "Main"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "powershell -NoProfile -Command \"$input = [Console]::In.ReadToEnd() | ConvertFrom-Json; $model=$input.model.display_name; $pct=[math]::Round($input.context_window.used_percentage); $bar=[math]::Round($pct/10); $filled='█' * $bar; $empty='░' * (10-$bar); Write-Output ('[' + $model + '] ' + $filled + $empty + ' ' + $pct + '% context')\""
+  }
+}

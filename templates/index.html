@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IT Support RAG Copilot</title>
+    <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1>🛠️ IT Support Copilot</h1>
+            <p class="subtitle">Enterprise Agentic RAG Assistant</p>
+        </header>
+
+        <div id="chat-box" class="chat-box">
+            <div class="message bot">
+                <div class="bubble">Hi! I'm your IT Support Copilot. Ask me about VPN setup, password resets, MFA, laptop configuration, or any company IT policy.</div>
+            </div>
+        </div>
+
+        <form id="chat-form" class="chat-input">
+            <input type="text" id="question" placeholder="Ask an IT support question…" autocomplete="off" required />
+            <button type="submit" id="send-btn">Send</button>
+        </form>
+
+        <!-- Trace / debug drawer -->
+        <details id="trace-drawer" class="trace-drawer" style="display:none">
+            <summary>🔍 Agent Trace</summary>
+            <ol id="trace-list"></ol>
+        </details>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
