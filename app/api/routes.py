@@ -105,6 +105,16 @@ def validate_uploaded_content(filename: str, content: bytes) -> None:
             ) from exc
 
 
+import logging
+from pathlib import Path
+from fastapi import APIRouter, File, Header, HTTPException, UploadFile
+
+# Assuming router, settings, SUPPORTED, calculate_document_hash, is_document_unchanged,
+# get_document, mark_document_pending, load_file, chunk_documents, add_documents,
+# delete_documents, mark_document_indexed, and validate_uploaded_content are imported/defined.
+
+
+
 @router.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),
@@ -116,7 +126,6 @@ async def ingest(
 
     filename = Path(file.filename or "").name
     suffix = Path(filename).suffix.lower()
-
     if not filename or suffix not in SUPPORTED:
         raise HTTPException(
             status_code=400,
@@ -124,7 +133,26 @@ async def ingest(
         )
 
     try:
-        file_bytes = await file.read()
+        # Stream the file in chunks to enforce the maximum upload limit in memory
+        max_bytes = settings.max_upload_size_mb * 1024 * 1024
+        file_bytes = bytearray()
+        
+        while True:
+            remaining = max_bytes + 1 - len(file_bytes)
+            if remaining <= 0:
+                break
+            
+            block = await file.read(min(64 * 1024, remaining))
+            if not block:
+                break
+            
+            file_bytes.extend(block)
+            
+            if len(file_bytes) > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the maximum upload size of {settings.max_upload_size_mb} MB.",
+                )
 
         if not file_bytes:
             raise HTTPException(
@@ -132,13 +160,17 @@ async def ingest(
                 detail="Uploaded file is empty.",
             )
 
+        file_bytes = bytes(file_bytes)
+        
+        # Optional custom content validation step based on your snippet
+        validate_uploaded_content(filename, file_bytes)
+
         # Step 1: Identify the exact uploaded file version.
         document_hash = calculate_document_hash(file_bytes)
 
         # Step 2: Save the file for the existing document loaders.
         upload_dir = Path(settings.upload_dir).resolve()
         upload_dir.mkdir(parents=True, exist_ok=True)
-
         destination = upload_dir / filename
         destination.write_bytes(file_bytes)
 
@@ -156,9 +188,7 @@ async def ingest(
         # vectors belong to this document.
         previous_record = get_document(filename)
         old_ids = (
-            previous_record["chunk_ids"]
-            if previous_record is not None
-            else []
+            previous_record["chunk_ids"] if previous_record is not None else []
         )
 
         # Step 4: Mark this version pending. The manifest retains
@@ -167,7 +197,6 @@ async def ingest(
 
         # Step 5: Load and split the document.
         documents = load_file(destination)
-
         for document in documents:
             document.metadata.update({
                 "document_name": filename,
@@ -175,7 +204,6 @@ async def ingest(
             })
 
         chunks = chunk_documents(documents)
-
         if not chunks:
             raise HTTPException(
                 status_code=400,
@@ -184,7 +212,6 @@ async def ingest(
 
         # Step 6: Upsert the new version using deterministic IDs.
         new_ids = add_documents(chunks)
-
         if not new_ids:
             raise RuntimeError(
                 "Vector store did not return IDs for the indexed chunks."
@@ -194,10 +221,8 @@ async def ingest(
         # manifest version. New vectors are already indexed.
         new_id_set = set(new_ids)
         obsolete_ids = [
-            old_id for old_id in old_ids
-            if old_id not in new_id_set
+            old_id for old_id in old_ids if old_id not in new_id_set
         ]
-
         delete_documents(obsolete_ids)
 
         # Step 8: Commit the new version to the manifest only
@@ -219,20 +244,16 @@ async def ingest(
 
     except HTTPException:
         raise
-
     except Exception as exc:
         # Log the exception server-side rather than exposing
         # internal implementation details to API clients.
-        import logging
         logging.getLogger(__name__).exception(
-            "Document ingestion failed for %s",
-            filename,
+            "Document ingestion failed for %s", filename
         )
-
         raise HTTPException(
             status_code=500,
             detail="Document ingestion failed. Check application logs.",
         ) from exc
-
     finally:
         await file.close()
+
